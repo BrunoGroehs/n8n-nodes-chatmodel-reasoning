@@ -28,6 +28,8 @@ interface OpenAIMessage {
 
 interface OpenAIChoice {
 	message?: OpenAIMessage;
+	logprobs?: Record<string, unknown> | null;
+	finish_reason?: string;
 }
 
 interface OpenAIResponse {
@@ -91,13 +93,14 @@ function createReasoningFetch(
 
 			if (!captureReasoning) continue;
 
-			// Normalise: expose reasoning under a single field name so LangChain
-			// picks it up in additional_kwargs._reasoning — content stays clean.
+			// Inject reasoning into choice.logprobs → LangChain maps this to
+			// generationInfo.logprobs, which N8nLlmTracing records in the execution log.
+			// content stays clean (final answer only).
 			const thinking =
 				choice.message.reasoning ?? choice.message.reasoning_content ?? '';
 			if (thinking.trim()) {
-				(choice.message as Record<string, unknown>)['_reasoning'] = thinking;
-				// Remove the original fields to avoid duplication
+				choice.logprobs = { ...(choice.logprobs ?? {}), _reasoning: thinking };
+				// Remove from message to avoid duplication in additional_kwargs
 				delete choice.message.reasoning;
 				delete choice.message.reasoning_content;
 			}
@@ -278,11 +281,11 @@ export class LmChatReasoning implements INodeType {
 				displayOptions: { show: { enableReasoning: [true] } },
 				default: false,
 				description:
-					'Whether to request the reasoning text back from the API. The final answer (text) stays clean — the reasoning is stored separately in <code>additional_kwargs._reasoning</code> and is visible in the execution log. When off, the model reasons silently (better quality, lower cost).',
+					'Whether to request the reasoning text back from the API. The final answer (text) stays clean — the reasoning is stored in <code>generationInfo.logprobs._reasoning</code>, visible in the execution log. When off, the model reasons silently (better quality, lower cost).',
 			},
 			{
 				displayName:
-					'When "Capture Reasoning" is on: the <strong>text output stays clean</strong> (only the final answer). The thinking content is stored in <code>additional_kwargs._reasoning</code> — visible in this node\'s execution log for debugging.',
+					'When "Capture Reasoning" is on: the <strong>text output stays clean</strong> (only the final answer). The thinking content is stored in <code>generationInfo.logprobs._reasoning</code> — visible in this node\'s execution log for debugging.',
 				name: 'captureReasoningNotice',
 				type: 'notice',
 				default: '',
