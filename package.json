@@ -1,0 +1,47 @@
+{
+  "name": "@bruno_groehs/n8n-nodes-chatmodel-reasoning",
+  "version": "0.2.0",
+  "description": "n8n ChatModel node with extended reasoning/thinking support for OpenRouter, DeepSeek, and any OpenAI-compatible API",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc && node scripts/copy-assets.js",
+    "dev": "tsc -w",
+    "lint": "eslint src --ext .ts"
+  },
+  "n8n": {
+    "n8nNodesApiVersion": 1,
+    "credentials": [
+      "dist/credentials/OpenAiCompatibleReasoningApi.credentials.js"
+    ],
+    "nodes": [
+      "dist/nodes/LmChatReasoning/LmChatReasoning.node.js"
+    ]
+  },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "n8n-community-node-package",
+    "n8n",
+    "ai",
+    "llm",
+    "reasoning",
+    "thinking",
+    "openrouter",
+    "deepseek"
+  ],
+  "peerDependencies": {
+    "n8n-workflow": "*"
+  },
+  "dependencies": {
+    "@langchain/openai": "^1.4.0",
+    "@langchain/core": "^1.1.0",
+    "@n8n/ai-utilities": "^0.15.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0",
+    "n8n-workflow": "^1.0.0"
+  }
+}
