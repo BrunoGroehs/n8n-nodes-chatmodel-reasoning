@@ -45,21 +45,115 @@ function isOpenAIResponse(json: unknown): json is OpenAIResponse {
 	);
 }
 
+// ─── Prompt-caching helpers ──────────────────────────────────────────────────
+
+interface CacheControlConfig {
+	enabled: boolean;
+	ttl: '5m' | '1h';
+	splitMarker: string;
+	sessionId: string;
+}
+
+interface ChatMessage {
+	role?: string;
+	content?: unknown;
+	[key: string]: unknown;
+}
+
+interface ChatRequestBody {
+	messages?: ChatMessage[];
+	session_id?: string;
+	[key: string]: unknown;
+}
+
+/**
+ * Rewrites the outgoing request body to activate manual prompt caching on
+ * providers that require explicit breakpoints (Qwen, Anthropic). Transforms
+ * the first system message so its `content` becomes an array of text blocks
+ * with `cache_control` on the static prefix.
+ *
+ * Providers that don't require `cache_control` (OpenAI, Gemini, DeepSeek, etc.)
+ * silently ignore the field — so the same payload shape is safe across models.
+ *
+ * See CACHE_CONTROL_OPENROUTER.md for the design rationale.
+ */
+function applyPromptCaching(bodyStr: string, cfg: CacheControlConfig): string {
+	if (!cfg.enabled && !cfg.sessionId) return bodyStr;
+
+	let body: ChatRequestBody;
+	try {
+		body = JSON.parse(bodyStr) as ChatRequestBody;
+	} catch {
+		return bodyStr;
+	}
+	if (typeof body !== 'object' || body === null) return bodyStr;
+
+	if (cfg.sessionId) {
+		body.session_id = cfg.sessionId;
+	}
+
+	if (cfg.enabled && Array.isArray(body.messages)) {
+		const systemIdx = body.messages.findIndex((m) => m?.role === 'system');
+		if (systemIdx !== -1) {
+			const sys = body.messages[systemIdx];
+			// Only transform when content is a plain string (idempotent — skip arrays)
+			if (typeof sys.content === 'string') {
+				const cacheControl: Record<string, unknown> = { type: 'ephemeral' };
+				if (cfg.ttl === '1h') cacheControl.ttl = '1h';
+
+				const marker = cfg.splitMarker;
+				const idx = marker ? sys.content.indexOf(marker) : -1;
+
+				if (idx > 0) {
+					const staticPart = sys.content.slice(0, idx);
+					const runtimePart = sys.content.slice(idx);
+					sys.content = [
+						{ type: 'text', text: staticPart, cache_control: cacheControl },
+						{ type: 'text', text: runtimePart },
+					];
+				} else {
+					// No marker found — treat whole system prompt as static.
+					// User opted into caching; if the prompt has volatile parts,
+					// they should add the split marker.
+					sys.content = [
+						{ type: 'text', text: sys.content, cache_control: cacheControl },
+					];
+				}
+			}
+		}
+	}
+
+	return JSON.stringify(body);
+}
+
 // ─── Fetch wrapper ────────────────────────────────────────────────────────────
 
 /**
- * Intercepts the raw API response to:
- * 1. Keep `content` as the clean final answer only.
- * 2. Move reasoning to a dedicated `_reasoning` field so LangChain stores it
+ * Intercepts the raw API request/response to:
+ * 1. Rewrite the outgoing body to add `cache_control` breakpoints and
+ *    optionally `session_id`, activating manual prompt caching (see
+ *    CACHE_CONTROL_OPENROUTER.md).
+ * 2. Keep `content` as the clean final answer only.
+ * 3. Move reasoning to a dedicated `_reasoning` field so LangChain stores it
  *    in additional_kwargs._reasoning (accessible in n8n execution data).
- * 3. Fix the OpenRouter+Anthropic quirk of empty tool-call arguments.
+ * 4. Fix the OpenRouter+Anthropic quirk of empty tool-call arguments.
  */
 function createReasoningFetch(
 	baseFetch: typeof globalThis.fetch,
 	captureReasoning: boolean,
+	cacheCfg: CacheControlConfig,
 ): typeof globalThis.fetch {
 	return async (input, init) => {
-		const response = await baseFetch(input, init);
+		// Rewrite outgoing body for prompt caching / session_id
+		let nextInit = init;
+		if ((cacheCfg.enabled || cacheCfg.sessionId) && init?.body && typeof init.body === 'string') {
+			const patched = applyPromptCaching(init.body, cacheCfg);
+			if (patched !== init.body) {
+				nextInit = { ...init, body: patched };
+			}
+		}
+
+		const response = await baseFetch(input, nextInit);
 
 		const contentType = response.headers.get('content-type') ?? '';
 		if (!contentType.includes('json')) return response;
@@ -294,6 +388,54 @@ export class LmChatReasoning implements INodeType {
 				},
 			},
 
+			// ── Prompt caching ───────────────────────────────────────────────
+			{
+				displayName: 'Enable Prompt Caching',
+				name: 'enablePromptCaching',
+				type: 'boolean',
+				default: false,
+				description:
+					'Whether to activate manual prompt caching by adding <code>cache_control</code> breakpoints to the system message. Required by Qwen and Anthropic; harmless (ignored) by OpenAI/Gemini/DeepSeek/etc. See <a href="https://openrouter.ai/docs/features/prompt-caching" target="_blank">OpenRouter docs</a>.',
+			},
+			{
+				displayName: 'Cache Split Marker',
+				name: 'cacheSplitMarker',
+				type: 'string',
+				displayOptions: { show: { enablePromptCaching: [true] } },
+				default: '## RUNTIME CONTEXT',
+				description:
+					'Substring in the system prompt that separates the <strong>static prefix</strong> (cached) from the <strong>volatile suffix</strong> (never cached — should hold things like current date, per-request context). The marker itself stays in the volatile block. If the marker is not found in the prompt, the entire system message is treated as static.',
+			},
+			{
+				displayName: 'Cache TTL',
+				name: 'cacheTtl',
+				type: 'options',
+				displayOptions: { show: { enablePromptCaching: [true] } },
+				options: [
+					{
+						name: '5 Minutes (Default)',
+						value: '5m',
+						description: 'Standard ephemeral cache. Write cost: 1.25× input.',
+					},
+					{
+						name: '1 Hour (Extended)',
+						value: '1h',
+						description:
+							'Extended cache. Write cost: 2× input. Use if conversations typically span more than 5 minutes between requests.',
+					},
+				],
+				default: '5m',
+				description: 'How long the cache entry stays warm on the provider',
+			},
+			{
+				displayName: 'Session ID',
+				name: 'sessionId',
+				type: 'string',
+				default: '',
+				description:
+					'Optional stable identifier for the conversation. When set, OpenRouter uses it for sticky routing — the same physical provider handles subsequent requests, keeping the cache warm. Use an n8n expression like <code>{{ $json.chatId }}</code>. Leave empty to rely on automatic routing.',
+			},
+
 			// ── Options collection (same pattern as official nodes) ──────────
 			{
 				displayName:
@@ -424,6 +566,23 @@ export class LmChatReasoning implements INodeType {
 			false,
 		) as boolean;
 
+		const enablePromptCaching = this.getNodeParameter(
+			'enablePromptCaching',
+			itemIndex,
+			false,
+		) as boolean;
+		const cacheSplitMarker = this.getNodeParameter(
+			'cacheSplitMarker',
+			itemIndex,
+			'## RUNTIME CONTEXT',
+		) as string;
+		const cacheTtl = this.getNodeParameter(
+			'cacheTtl',
+			itemIndex,
+			'5m',
+		) as '5m' | '1h';
+		const sessionId = this.getNodeParameter('sessionId', itemIndex, '') as string;
+
 		const options = this.getNodeParameter('options', itemIndex, {}) as {
 			frequencyPenalty?: number;
 			maxTokens?: number;
@@ -449,7 +608,16 @@ export class LmChatReasoning implements INodeType {
 
 		const configuration: ClientOptions = {
 			baseURL: credentials.url,
-			fetch: createReasoningFetch(globalThis.fetch, enableReasoning && captureReasoning),
+			fetch: createReasoningFetch(
+				globalThis.fetch,
+				enableReasoning && captureReasoning,
+				{
+					enabled: enablePromptCaching,
+					ttl: cacheTtl,
+					splitMarker: cacheSplitMarker,
+					sessionId: sessionId?.trim() ?? '',
+				},
+			),
 		};
 
 		const model = new ChatOpenAI({

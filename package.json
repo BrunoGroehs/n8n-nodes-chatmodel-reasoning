@@ -1,6 +1,6 @@
 {
   "name": "@bruno_groehs/n8n-nodes-chatmodel-reasoning",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "n8n ChatModel node with extended reasoning/thinking support for OpenRouter, DeepSeek, and any OpenAI-compatible API",
   "license": "MIT",
   "main": "dist/index.js",
@@ -32,12 +32,10 @@
     "deepseek"
   ],
   "peerDependencies": {
-    "n8n-workflow": "*"
-  },
-  "dependencies": {
-    "@langchain/openai": "^1.4.0",
-    "@langchain/core": "^1.1.0",
-    "@n8n/ai-utilities": "^0.15.0"
+    "n8n-workflow": "*",
+    "@langchain/openai": ">=1.0.0",
+    "@langchain/core": ">=0.3.0",
+    "@n8n/ai-utilities": ">=0.1.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
