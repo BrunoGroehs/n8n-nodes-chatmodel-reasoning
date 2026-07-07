@@ -12,6 +12,8 @@ import {
 	type INodeTypeDescription,
 	type ISupplyDataFunctions,
 	type SupplyData,
+	type ILoadOptionsFunctions,
+	type INodeListSearchResult,
 } from 'n8n-workflow';
 
 // ─── Response-shape helpers ──────────────────────────────────────────────────
@@ -291,36 +293,29 @@ export class LmChatReasoning implements INodeType {
 			{
 				displayName: 'Model',
 				name: 'model',
-				type: 'options',
+				type: 'resourceLocator',
+				default: { mode: 'list', value: 'deepseek/deepseek-r1' },
+				required: true,
 				description:
 					'The model to use. <a href="https://openrouter.ai/models" target="_blank">Browse OpenRouter models</a>.',
-				typeOptions: {
-					loadOptions: {
-						routing: {
-							request: { method: 'GET', url: '/models' },
-							output: {
-								postReceive: [
-									{
-										type: 'rootProperty',
-										properties: { property: 'data' },
-									},
-									{
-										type: 'setKeyValue',
-										properties: {
-											name: '={{$responseItem.name}} ({{$responseItem.id}})',
-											value: '={{$responseItem.id}}',
-										},
-									},
-									{
-										type: 'sort',
-										properties: { key: 'name' },
-									},
-								],
-							},
+				modes: [
+					{
+						displayName: 'From List',
+						name: 'list',
+						type: 'list',
+						typeOptions: {
+							searchListMethod: 'getModels',
+							searchable: true,
 						},
 					},
-				},
-				default: 'deepseek/deepseek-r1',
+					{
+						displayName: 'By ID',
+						name: 'id',
+						type: 'string',
+						placeholder: 'e.g. deepseek/deepseek-r1',
+						hint: 'Paste the model ID from openrouter.ai/models',
+					},
+				],
 			},
 
 			// ── Reasoning controls ───────────────────────────────────────────
@@ -539,6 +534,33 @@ export class LmChatReasoning implements INodeType {
 		],
 	};
 
+	methods = {
+		listSearch: {
+			async getModels(this: ILoadOptionsFunctions, filter?: string): Promise<INodeListSearchResult> {
+				const credentials = await this.getCredentials<{ apiKey: string; url: string }>(
+					'openAiCompatibleReasoningApi',
+				);
+				const baseUrl = credentials.url.replace(/\/+$/, '');
+				const response = await this.helpers.request({
+					method: 'GET',
+					url: `${baseUrl}/models`,
+					headers: { Authorization: `Bearer ${credentials.apiKey}` },
+					json: true,
+				}) as { data: Array<{ id: string; name: string }> };
+
+				const items = (response.data ?? [])
+					.filter((m) => !filter || m.id.toLowerCase().includes(filter.toLowerCase()) || m.name.toLowerCase().includes(filter.toLowerCase()))
+					.sort((a, b) => a.name.localeCompare(b.name))
+					.map((m) => ({
+						name: `${m.name} (${m.id})`,
+						value: m.id,
+					}));
+
+				return { results: items };
+			},
+		},
+	};
+
 	async supplyData(this: ISupplyDataFunctions, itemIndex: number): Promise<SupplyData> {
 		const credentials = await this.getCredentials<{ apiKey: string; url: string }>(
 			'openAiCompatibleReasoningApi',
@@ -548,7 +570,19 @@ export class LmChatReasoning implements INodeType {
 			throw new NodeOperationError(this.getNode(), 'API Key is required in the credentials.');
 		}
 
-		const modelName = this.getNodeParameter('model', itemIndex) as string;
+		const modelParam = this.getNodeParameter('model', itemIndex) as
+			| string
+			| { mode?: string; value?: string };
+		// Support both legacy (bare string from type:'options') and new (resourceLocator { mode, value }) shapes.
+		const modelName =
+			typeof modelParam === 'string' ? modelParam : (modelParam?.value ?? '').toString().trim();
+
+		if (!modelName) {
+			throw new NodeOperationError(
+				this.getNode(),
+				'Model is required. Set it by ID (e.g. "deepseek/deepseek-r1") or select one from the list.',
+			);
+		}
 		const enableReasoning = this.getNodeParameter('enableReasoning', itemIndex, false) as boolean;
 		const reasoningEffort = this.getNodeParameter(
 			'reasoningEffort',
